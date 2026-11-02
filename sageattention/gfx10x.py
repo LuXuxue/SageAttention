@@ -168,6 +168,11 @@ def gfx10x_sageattn(
     # shapes); gfx1103 keeps the direct/int8 balance.
     arch = getattr(torch.cuda.get_device_properties(torch.cuda.current_device()), "gcnArchName", None)
     is_gfx103 = isinstance(arch, str) and arch.startswith("gfx103")
+    # Defaults below are tuned on gfx1101 (RX 7800 XT, 60 CU). Measured e2e
+    # (min of 3 interleaved rounds, clock-warmed): the direct fp16/bf16 path and
+    # the int8 path are within ~1% of each other up to 4096 tokens, so keeping
+    # direct for small kv and int8 from 6144 up is the best split; cross-attention
+    # (q_len * 2 < kv_len) always prefers int8.
     if headdim == 64:
         if is_gfx103:
             use_direct = False
@@ -175,9 +180,9 @@ def gfx10x_sageattn(
             d64_default = 2048 if tensor_layout == "HND" else 3072
             thr_d64 = int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64", str(d64_default)) or d64_default)
             if is_causal:
-                use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64_CAUSAL", "6144") or 6144))
+                use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64_CAUSAL", "8192") or 8192))
             elif q_len < kv_len_actual:
-                use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64_CROSS", "6144") or 6144))
+                use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64_CROSS", "0") or 0))
             else:
                 use_direct = (kv_len_actual <= thr_d64)
     else:
@@ -190,9 +195,11 @@ def gfx10x_sageattn(
             # severe perf cliff (e.g. ~68 ms vs ~33 ms at S=6144). Keep the direct
             # path for tiny kv (<= 256) where the int8 prepass overhead dominates
             # and for the small-Q / large-KV cross case (q_len*2 < kv_len).
-            thr_d128 = int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D128", "256") or 256)
+            # gfx1101: 6144 is the measured split (direct <= 4096 is within 1% of
+            # int8, int8 is 3-5% ahead at 8192).
+            thr_d128 = int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D128", "6144") or 6144)
             if q_len * 2 < kv_len_actual:
-                use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D128_CROSS", "4096") or 4096))
+                use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D128_CROSS", "0") or 0))
             else:
                 use_direct = (kv_len_actual <= thr_d128)
 

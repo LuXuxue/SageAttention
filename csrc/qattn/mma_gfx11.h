@@ -46,15 +46,19 @@ __device__ __forceinline__ unsigned permlanex16_u32(unsigned src) {
     return result;
 }
 
+// One 16 B LDS read per fragment.  Callers guarantee 16 B alignment: the k_tile
+// row stride is (HeadDim + LDS_PAD) bytes with LDS_PAD = 16 (144 B for D=128,
+// 80 B for D=64) and kbyte is a multiple of 16.  The previous form used four
+// scalar int loads, which the compiler lowered to two ds_load_2addr_b32.
 __device__ __forceinline__ int32_t_v4 load_i8_frag(
     const void* lds, int row, int kbyte, int stride) {
     const char* p = static_cast<const char*>(lds) + row * stride + kbyte;
+    const uint4 v = *reinterpret_cast<const uint4*>(p);
     int32_t_v4 r;
-    const int* q = reinterpret_cast<const int*>(p);
-    r[0] = q[0];
-    r[1] = q[1];
-    r[2] = q[2];
-    r[3] = q[3];
+    r[0] = static_cast<int>(v.x);
+    r[1] = static_cast<int>(v.y);
+    r[2] = static_cast<int>(v.z);
+    r[3] = static_cast<int>(v.w);
     return r;
 }
 

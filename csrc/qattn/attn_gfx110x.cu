@@ -471,11 +471,14 @@ __device__ __forceinline__ void attn_kernel_impl_t(
     constexpr int KStride = HeadDim + LDS_PAD;
 
     // k_tile: [BLOCK_N 行 x KStride i8], 行 stride 加 LDS_PAD 避免 bank 冲突。
-    __shared__ int8_t k_tile[BLOCK_N * KStride];
+    // __align__(16): load_i8_frag 用单条 16 B LDS 读 (ds_read_b128) 取 fragment。
+    __shared__ __align__(16) int8_t k_tile[BLOCK_N * KStride];
 
     // v_tile: V_T 当前 tile 的 LDS 副本, 布局 [D][N], 行 = D 维, n 连续 16 half 行读。
-    // VTileStride=80 half (行间 8 bank 偏移) 消除 PV 的 per-lane 全局行读冗余。
+    // VTileStride=80 half (160 B: 行间 8 bank 偏移, 且保持 32 B 对齐供 v16h 读写)。
     constexpr int VTileStride = 80;
+    static_assert(BLOCK_M < 128 || BLOCK_N <= VTileStride,
+                  "v_tile stride must cover BLOCK_N");
     __shared__ __align__(32) __half v_tile[HeadDim * VTileStride];
 
     const int tid = threadIdx.x;
@@ -733,33 +736,22 @@ __device__ __forceinline__ void attn_kernel_impl_t(
             const int64_t o_off = (tensor_layout == kHND) ?
                 (b * o_stride_b + hq * o_stride_h + q_idx * o_stride_n + d) :
                 (b * o_stride_b + q_idx * o_stride_n + hq * o_stride_h + d);
-            if constexpr (std::is_same<OUT_DTYPE, __half>::value) {
-
-                alignas(16) unsigned b16[8];
+            // Both output dtypes share the word layout (hi<<16 | lo), so pack and
+            // store are dtype-independent.  Selecting the 4 words with `hw`
+            // instead of indexing a local array with `hw * 4` keeps the whole
+            // thing in VGPRs: the old form compiled to a 48 B private-segment
+            // scratch array plus 48 scratch ops in the epilogue.
+            unsigned w[8];
 #pragma unroll
-                for (int k = 0; k < 4; ++k) {
-                    const unsigned even = (hw == 0) ? pack[k] : cross[k];
-                    const unsigned odd = (hw == 0) ? cross[k] : pack[k];
-                    b16[2 * k] = (even & 0xFFFF) | ((odd & 0xFFFF) << 16);
-                    b16[2 * k + 1] = (even >> 16) | (odd & 0xFFFF0000);
-                }
-
-                *reinterpret_cast<uint4*>(reinterpret_cast<__half*>(output) + o_off) =
-                    *reinterpret_cast<const uint4*>(b16 + hw * 4);
-            } else {
-                alignas(16) __hip_bfloat16 b[16];
-#pragma unroll
-                for (int k = 0; k < 4; ++k) {
-                    const unsigned even = (hw == 0) ? pack[k] : cross[k];
-                    const unsigned odd = (hw == 0) ? cross[k] : pack[k];
-                    b[4 * k + 0] = __ushort_as_bfloat16(static_cast<unsigned short>(even & 0xFFFF));
-                    b[4 * k + 1] = __ushort_as_bfloat16(static_cast<unsigned short>(odd & 0xFFFF));
-                    b[4 * k + 2] = __ushort_as_bfloat16(static_cast<unsigned short>(even >> 16));
-                    b[4 * k + 3] = __ushort_as_bfloat16(static_cast<unsigned short>(odd >> 16));
-                }
-                *reinterpret_cast<uint4*>(reinterpret_cast<__hip_bfloat16*>(output) + o_off) =
-                    *reinterpret_cast<const uint4*>(b + hw * 8);
+            for (int k = 0; k < 4; ++k) {
+                const unsigned even = (hw == 0) ? pack[k] : cross[k];
+                const unsigned odd = (hw == 0) ? cross[k] : pack[k];
+                w[2 * k] = (even & 0xFFFFu) | ((odd & 0xFFFFu) << 16);
+                w[2 * k + 1] = (even >> 16) | (odd & 0xFFFF0000u);
             }
+            const uint4 ovec = (hw == 0) ? make_uint4(w[0], w[1], w[2], w[3])
+                                         : make_uint4(w[4], w[5], w[6], w[7]);
+            *reinterpret_cast<uint4*>(reinterpret_cast<char*>(output) + 2 * o_off) = ovec;
         }
     }
 }
@@ -801,7 +793,7 @@ __device__ __forceinline__ void attn_kernel_impl_32_t(
     constexpr int ColTiles = BLOCK_N / BK;
     constexpr int KStride = HeadDim + LDS_PAD;
 
-    __shared__ int8_t k_tile[BLOCK_N * KStride];
+    __shared__ __align__(16) int8_t k_tile[BLOCK_N * KStride];
 
     const int tid = threadIdx.x;
     const int lane = tid & 31;
@@ -1049,33 +1041,22 @@ for (int64_t kb_base = 0; kb_base < kv_limit; kb_base += BLOCK_N) {
             const int64_t o_off = (tensor_layout == kHND) ?
                 (b * o_stride_b + hq * o_stride_h + q_idx * o_stride_n + d) :
                 (b * o_stride_b + q_idx * o_stride_n + hq * o_stride_h + d);
-            if constexpr (std::is_same<OUT_DTYPE, __half>::value) {
-
-                alignas(16) unsigned b16[8];
+            // Both output dtypes share the word layout (hi<<16 | lo), so pack and
+            // store are dtype-independent.  Selecting the 4 words with `hw`
+            // instead of indexing a local array with `hw * 4` keeps the whole
+            // thing in VGPRs: the old form compiled to a 48 B private-segment
+            // scratch array plus 48 scratch ops in the epilogue.
+            unsigned w[8];
 #pragma unroll
-                for (int k = 0; k < 4; ++k) {
-                    const unsigned even = (hw == 0) ? pack[k] : cross[k];
-                    const unsigned odd = (hw == 0) ? cross[k] : pack[k];
-                    b16[2 * k] = (even & 0xFFFF) | ((odd & 0xFFFF) << 16);
-                    b16[2 * k + 1] = (even >> 16) | (odd & 0xFFFF0000);
-                }
-
-                *reinterpret_cast<uint4*>(reinterpret_cast<__half*>(output) + o_off) =
-                    *reinterpret_cast<const uint4*>(b16 + hw * 4);
-            } else {
-                alignas(16) __hip_bfloat16 b[16];
-#pragma unroll
-                for (int k = 0; k < 4; ++k) {
-                    const unsigned even = (hw == 0) ? pack[k] : cross[k];
-                    const unsigned odd = (hw == 0) ? cross[k] : pack[k];
-                    b[4 * k + 0] = __ushort_as_bfloat16(static_cast<unsigned short>(even & 0xFFFF));
-                    b[4 * k + 1] = __ushort_as_bfloat16(static_cast<unsigned short>(odd & 0xFFFF));
-                    b[4 * k + 2] = __ushort_as_bfloat16(static_cast<unsigned short>(even >> 16));
-                    b[4 * k + 3] = __ushort_as_bfloat16(static_cast<unsigned short>(odd >> 16));
-                }
-                *reinterpret_cast<uint4*>(reinterpret_cast<__hip_bfloat16*>(output) + o_off) =
-                    *reinterpret_cast<const uint4*>(b + hw * 8);
+            for (int k = 0; k < 4; ++k) {
+                const unsigned even = (hw == 0) ? pack[k] : cross[k];
+                const unsigned odd = (hw == 0) ? cross[k] : pack[k];
+                w[2 * k] = (even & 0xFFFFu) | ((odd & 0xFFFFu) << 16);
+                w[2 * k + 1] = (even >> 16) | (odd & 0xFFFF0000u);
             }
+            const uint4 ovec = (hw == 0) ? make_uint4(w[0], w[1], w[2], w[3])
+                                         : make_uint4(w[4], w[5], w[6], w[7]);
+            *reinterpret_cast<uint4*>(reinterpret_cast<char*>(output) + 2 * o_off) = ovec;
         }
     }
     }
@@ -1327,9 +1308,13 @@ __device__ __forceinline__ void direct_attn_kernel_impl_t(
     constexpr int THREADS = WARPS * 32;
     constexpr int DTiles = HeadDim / BK;
     constexpr int ColTiles = BLOCK_N / BK;
-    constexpr int KStride = HeadDim + LDS_PAD;
+    // The direct path reads K element-wise, so a smaller pad costs nothing in
+    // alignment: (HeadDim + 8) halfs = 272 B (D=128) / 144 B (D=64), both 16 B
+    // multiples, and the row-to-row rotation is 4 words instead of 8 -> 2-way
+    // instead of 4-way LDS bank conflicts on all 16 fragment reads per tile.
+    constexpr int KStride = HeadDim + 8;
 
-    __shared__ QK_DTYPE k_tile[BLOCK_N * KStride];
+    __shared__ __align__(16) QK_DTYPE k_tile[BLOCK_N * KStride];
 
     const int tid = threadIdx.x;
     const int lane = tid & 31;
@@ -1444,6 +1429,10 @@ for (int64_t kb_base = 0; kb_base < kv_limit; kb_base += BLOCK_N) {
 
             const int64_t k_col_start = kb_base + ct * BK;
             const int q_row_idx = static_cast<int>(q_start) + m_row;
+            // Uniform per tile: only the last KV tile of a call can have columns
+            // past kv_len.  Hoisting that test out of the 8-element loop removes
+            // 8 v_cmp_gt_i64 + 8 v_cndmask_b64 per iteration for every full tile.
+            const bool tail_cols = (k_col_start + BK) > kv_len;
 
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
@@ -1452,7 +1441,7 @@ for (int64_t kb_base = 0; kb_base < kv_limit; kb_base += BLOCK_N) {
                 if constexpr (IsCausal) {
                     if (col > q_row_idx) s = -FLT_MAX * 0.5f;
                 }
-                if (col >= kv_len) s = -FLT_MAX * 0.5f;
+                if (tail_cols && col >= kv_len) s = -FLT_MAX * 0.5f;
                 score_cache[ct][e] = s;
             }
         }
@@ -1846,7 +1835,11 @@ Tensor qk_int8_sv_bf16_attn_gfx110x_t(
     // at/above it BM128 is up to ~1.6x faster (e.g. Anima D128 self-attn at
     // S=4096: 26.6ms -> 16.4ms). The kv % 512 == 0 restriction is dropped since
     // BM128 is numerically correct for any kv_len (V_T is padded to 64).
-    const int bm128_thr = getenv("SAGEATTN_INT8_BM128_THR") ? atoi(getenv("SAGEATTN_INT8_BM128_THR")) : 2048;
+    // gfx1101 (60 CU) measurement: the crossover is much higher. kv=12288 is
+    // 8.8% faster on BM64/BN64 (45.70 -> 41.68 ms, 6 alternating runs each),
+    // kv=16384 is faster on BM128 (82.4 vs 92.7 ms for BM64), so the default
+    // threshold is 16k, not 2k.
+    const int bm128_thr = getenv("SAGEATTN_INT8_BM128_THR") ? atoi(getenv("SAGEATTN_INT8_BM128_THR")) : 16384;
     bool use_bm128_d128;
     if (bm128_sel == 1) use_bm128_d128 = true;
     else if (bm128_sel == 0) use_bm128_d128 = false;
@@ -2112,9 +2105,11 @@ Tensor fp16_attn_gfx110x_t(
         else if (bn_ov == 64) { LAUNCH_FP16_BN(128, 64, 64); }
         else if (bn_ov == 128) { LAUNCH_FP16_BN(128, 64, 128); }
         else if (bm_ov == 32) { LAUNCH_FP16_BN(128, 32, 16); }
-        else if (bm_ov == 128) { LAUNCH_FP16_BN(128, 128, 16); }
+        // Default BLOCK_M=128: the BM=64 instantiation needs 226 VGPRs and spills
+        // 48 B of scratch with a 677-instruction loop body, vs 200 VGPRs / 0 spill
+        // / 358 instructions for BM=128.  Measured 4.87 -> 4.66 ms at 4096/128/fp16.
         else if (bm_ov == 64) { LAUNCH_FP16_BN(128, 64, 16); }
-        else { LAUNCH_FP16_BN(128, 64, 16); }
+        else { LAUNCH_FP16_BN(128, 128, 16); }
     }
     #undef LAUNCH_FP16_T
     #undef LAUNCH_FP16_BN
@@ -2214,9 +2209,9 @@ Tensor bf16_attn_gfx110x_t(
         else if (bn_ov == 64) { LAUNCH_BF16_BN(128, 64, 64); }
         else if (bn_ov == 128) { LAUNCH_BF16_BN(128, 64, 128); }
         else if (bm_ov == 32) { LAUNCH_BF16_BN(128, 32, 16); }
-        else if (bm_ov == 128) { LAUNCH_BF16_BN(128, 128, 16); }
+        // Default BLOCK_M=128, matching fp16 (spill-free 200 VGPR kernel).
         else if (bm_ov == 64) { LAUNCH_BF16_BN(128, 64, 16); }
-        else { LAUNCH_BF16_BN(128, 64, 16); }
+        else { LAUNCH_BF16_BN(128, 128, 16); }
     }
     #undef LAUNCH_BF16_T
     #undef LAUNCH_BF16_BN

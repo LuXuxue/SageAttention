@@ -42,10 +42,19 @@ the direct paths, identical to upstream.
 
 ## Install
 
-### From your own build (recommended on Windows)
+### From source on Windows (recommended)
 
-`build/sagehip-build.bat`-style script — it fetches this repo, builds for `gfx1101` with Ninja and
-installs into the ComfyUI embedded Python:
+```bat
+git clone https://github.com/aksugat/SageAttention-HIP.git
+cd SageAttention-HIP
+scripts\sagehip-build.bat
+```
+
+`scripts\sagehip-build.bat` builds for the arch set at the top of the file (`GPU_ARCH=gfx1101` by
+default), installs into the Python it points at (`PY=H:\rocm313\python_embeded\python.exe` by default)
+and clears the import cache. The first build is slow; later ones reuse `build/` and take seconds.
+
+Or do it by hand:
 
 ```bat
 set "GPU_ARCHS=gfx1101"
@@ -54,7 +63,6 @@ python -m pip install . --no-build-isolation --no-deps --force-reinstall
 ```
 
 Set `GPU_ARCHS` to the arch of your card (`gfx1100`/`gfx1101`/`gfx1102`/`gfx1030`/`gfx1031`/`gfx1032`).
-The first build is slow; later ones reuse `build/` and take seconds.
 
 ### Use
 

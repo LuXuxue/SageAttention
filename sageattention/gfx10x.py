@@ -172,7 +172,7 @@ def gfx10x_sageattn(
     # (min of 3 interleaved rounds, clock-warmed): the direct fp16/bf16 path and
     # the int8 path are within ~1% of each other up to 4096 tokens, so keeping
     # direct for small kv and int8 from 6144 up is the best split; cross-attention
-    # (q_len * 2 < kv_len) always prefers int8.
+    # (q_len * 2 < kv_len) prefers direct up to 8192 on gfx1101.
     if headdim == 64:
         if is_gfx103:
             use_direct = False
@@ -196,10 +196,15 @@ def gfx10x_sageattn(
             # path for tiny kv (<= 256) where the int8 prepass overhead dominates
             # and for the small-Q / large-KV cross case (q_len*2 < kv_len).
             # gfx1101: 6144 is the measured split (direct <= 4096 is within 1% of
-            # int8, int8 is 3-5% ahead at 8192).
+            # int8, int8 is 3-5% ahead at 8192).  For the small-Q / large-KV case
+            # the direct kernel wins instead: it skips the quantization prepass and
+            # its V_T reads stay cache-resident.
+            #   q=512  kv=4096  int8 1.33 ms -> direct 0.97 ms (-27%)
+            #   q=1024 kv=8192  int8 3.11 ms -> direct 2.76 ms (-11%)
+            #   q=2048 kv=8192  int8 5.08 ms -> direct 4.74 ms ( -7%)
             thr_d128 = int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D128", "6144") or 6144)
             if q_len * 2 < kv_len_actual:
-                use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D128_CROSS", "0") or 0))
+                use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D128_CROSS", "8192") or 8192))
             else:
                 use_direct = (kv_len_actual <= thr_d128)
 

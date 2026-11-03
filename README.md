@@ -23,11 +23,12 @@ shapes, clock-warmed, 6 alternating measurements per configuration; "best" is th
 |---|---|
 | `INT8_BM128_THR` default 2048 → **16384** (BM=128 stages V in LDS, but on 60 CUs it only wins from ~16k up) | kv=12288: **45.70 → 41.68 ms (−8.8%)**; kv=16384 keeps the faster BM=128 kernel |
 | D128 direct fp16/bf16 `BLOCK_M` 64 → **128** (the BM=64 instantiation needs 226 VGPRs and spills 48 B of scratch) | 4096/128/fp16: **4.87 → 4.66 ms** |
+| Cross-attention `D128_CROSS` 0 → **8192**: direct wins when `q_len*2 < kv_len` (no quantization prepass, V_T stays cache-resident) | q=512 kv=4096: **1.33 → 0.97 ms (−27%)**; q=1024 kv=8192: 3.11 → 2.76 ms (−11%) |
 | `load_i8_frag`: one 16 B LDS read instead of four scalar int loads (which compiled to two `ds_load_2addr_b32`) | part of the 16k win below |
 | Direct path: K row stride `HeadDim+16` → `+8` halfs → 2-way instead of 4-way LDS bank conflicts | direct path, small kv |
 | Epilogue: dtype-independent pack + register select instead of an `hw*4` indexed local array (was 48 B private scratch + 48 scratch ops) | all paths |
 | Direct path: `col >= kv_len` hoisted out of the 8-element loop | direct path |
-| Dispatch defaults for `gfx1101`: D128 6144, D64 causal 8192, cross 0 (see the knob table) | best path picked without any env vars |
+| Dispatch defaults for `gfx1101`: D128 6144, D64 causal 8192, D128 cross 8192 (see the knob table) | best path picked without any env vars |
 | End-to-end result at 16384 tokens, 24 heads, bf16 | **82.4 → 78.8 ms (−4.5%)** |
 
 Same numerics as before: relL2 vs a float32 reference is **1.2e-2** on the int8 paths and **3e-4** on
@@ -133,7 +134,7 @@ they work unmodified on `gfx1101`, and the `gfx103x` path keeps its own defaults
 |---|---|---|
 | `SAGEATTN_BACKEND` | `native` | `native` = HIP/WMMA kernels, `triton` = upstream Triton path. Read at import. |
 | `SAGEATTN_DIRECT_THRESHOLD_D128` | `6144` | use the non-quantized direct kernel up to this kv length (D=128) |
-| `SAGEATTN_DIRECT_THRESHOLD_D128_CROSS` | `0` | same, for `q_len * 2 < kv_len` (0 = always int8) |
+| `SAGEATTN_DIRECT_THRESHOLD_D128_CROSS` | `8192` | same, for `q_len * 2 < kv_len` (0 = always int8) |
 | `SAGEATTN_DIRECT_THRESHOLD_D64` | `2048` HND / `3072` NHD | direct/int8 split for D=64 self-attention |
 | `SAGEATTN_DIRECT_THRESHOLD_D64_CAUSAL` | `8192` | direct kernel limit for D=64 causal |
 | `SAGEATTN_DIRECT_THRESHOLD_D64_CROSS` | `0` | D=64 cross-attention |
@@ -181,3 +182,4 @@ Contributions and measurements on other RDNA3 cards are welcome — please inclu
 * [LuXuxue/SageAttention](https://github.com/LuXuxue/SageAttention) — HIP `gfx103x`/`gfx110x` port, dispatch and knobs
 
 Apache-2.0, see [LICENSE](LICENSE).
+

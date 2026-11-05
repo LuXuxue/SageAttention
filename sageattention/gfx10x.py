@@ -168,6 +168,19 @@ def gfx10x_sageattn(
     # shapes); gfx1103 keeps the direct/int8 balance.
     arch = getattr(torch.cuda.get_device_properties(torch.cuda.current_device()), "gcnArchName", None)
     is_gfx103 = isinstance(arch, str) and arch.startswith("gfx103")
+    # The direct/int8 split was re-measured on gfx1103 (Radeon 780M, 12 CU) after
+    # the kernel-side fixes below; numbers are direct-vs-int8 wall clock at
+    # batch 1.  8/16/24/32 heads show the same crossover point.  Upstream's
+    # gfx1101 (RX 7800 XT, 60 CU) values are used for every other arch.
+    # Negative = direct faster, positive = int8 faster (medians, 7–9 runs).
+    #   self,  kv   256   512  1024  1536  2048
+    #   direct    -22%  -22%   -4%   +2%  +11%
+    #   cross (q*2 < kv), kv 1536  2048  4096  6144  8192
+    #   direct              -2%    -9%   -6%   +4%  +18%
+    # D64 (fp16, 20 heads): self 1024 -25%, 2048 +1%; causal 2048 -5%, 4096 -6%,
+    # 6144 +4%, 8192 +10%, 12288 +15%; cross q=512: 1536 -22%, 6144 -7%,
+    # 8192 -22%, and up to -9% at q=1024/kv=16384, i.e. direct always.
+    is_gfx1103 = isinstance(arch, str) and arch.startswith("gfx1103")
     if headdim == 64:
         if is_gfx103:
             use_direct = False
@@ -175,24 +188,27 @@ def gfx10x_sageattn(
             d64_default = 2048 if tensor_layout == "HND" else 3072
             thr_d64 = int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64", str(d64_default)) or d64_default)
             if is_causal:
-                use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64_CAUSAL", "6144") or 6144))
+                d64_causal = 4096 if is_gfx1103 else 8192
+                use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64_CAUSAL", str(d64_causal)) or d64_causal))
             elif q_len < kv_len_actual:
-                use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64_CROSS", "6144") or 6144))
+                # gfx1103: direct wins at every cross size measured (1536..16384).
+                d64_cross = (1 << 30) if is_gfx1103 else 0
+                use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64_CROSS", str(d64_cross)) or d64_cross))
             else:
                 use_direct = (kv_len_actual <= thr_d64)
     else:
         if is_gfx103:
             use_direct = False
         else:
-            # On gfx1103 (Radeon 780M, 12-CU) the int8 QK path is faster than the
-            # direct fp16/bf16 path for D128 with kv >= 512 (large/balanced query):
-            # int8 QK doubles compute throughput, and the direct path shows a
-            # severe perf cliff (e.g. ~68 ms vs ~33 ms at S=6144). Keep the direct
-            # path for tiny kv (<= 256) where the int8 prepass overhead dominates
-            # and for the small-Q / large-KV cross case (q_len*2 < kv_len).
-            thr_d128 = int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D128", "256") or 256)
+            # gfx1103 D128: the direct path wins up to kv=1024 (self) / 4096
+            # (q_len*2 < kv_len) and loses from ~1536 / ~6144 onwards, where the
+            # int8 QK path's 2x throughput wins (direct is 11% slower at 2048 and
+            # 18% slower at q=1024/kv=8192).
+            d128_default = 1024 if is_gfx1103 else 6144
+            thr_d128 = int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D128", str(d128_default)) or d128_default)
             if q_len * 2 < kv_len_actual:
-                use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D128_CROSS", "4096") or 4096))
+                d128_cross = 4096 if is_gfx1103 else 8192
+                use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D128_CROSS", str(d128_cross)) or d128_cross))
             else:
                 use_direct = (kv_len_actual <= thr_d128)
 
